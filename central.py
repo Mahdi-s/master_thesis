@@ -1,84 +1,139 @@
-# import the necessary packages
-from torchvision.models import detection
-import numpy as np
-import argparse
-import pickle
 import torch
-import cv2
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import os
+import numpy as np
+
+class WoundDataset(Dataset):
+    def __init__(self, image_folder, mask_folder, transform=None):
+        self.image_folder = image_folder
+        self.mask_folder = mask_folder
+        self.transform = transform
+        self.images = os.listdir(image_folder)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, index):
+        img_path = os.path.join(self.image_folder, self.images[index])
+        mask_path = os.path.join(self.mask_folder, self.images[index])
+
+        image = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+
+        if self.transform is not None:
+            image = self.transform(image)
+
+        return image, np.array(mask)
+
+# Define the data directories
+image_folder = "/home/ec2-user/repos/master_thesis/WoundData/images"
+mask_folder = "/home/ec2-user/repos/master_thesis/WoundData/labels"
+
+# Define the transforms for data augmentation
+transform = transforms.Compose([
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomVerticalFlip(),
+    transforms.RandomRotation(30),
+    transforms.ToTensor(),
+    transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+])
+
+# Define the dataset and data loader
+dataset = WoundDataset(image_folder, mask_folder, transform=transform)
+dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
 
 
-# construct the argument parser and parse the arguments
-ap = argparse.ArgumentParser()
-ap.add_argument("-i", "--image", type=str, required=True, help="path to the input image")
-ap.add_argument("-m", "--model", type=str, default="frcnn-resnet",choices=["frcnn-resnet", "frcnn-mobilenet", "retinanet"], help="name of the object detection model")
-ap.add_argument("-l", "--labels", type=str, default="coco_classes.pickle", help="path to file containing list of categories in COCO dataset")
-ap.add_argument("-c", "--confidence", type=float, default=0.5, help="minimum probability to filter weak detections")
-args = vars(ap.parse_args())
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        return x
+
+
+class UNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1, features=[64, 128, 256, 512]):
+        super().__init__()
+
+        self.downs = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # Define encoder path
+        for feature in features:
+            self.downs.append(DoubleConv(in_channels, feature))
+            in_channels = feature
+
+        # Define decoder path
+        for feature in reversed(features):
+            self.ups.append(nn.ConvTranspose2d(feature*2, feature, kernel_size=2, stride=2))
+            self.ups.append(DoubleConv(feature*2, feature))
+
+        self.bottleneck = DoubleConv(features[-1], features[-1]*2)
+        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        skip_connections = []
+        
+        # Encode path
+        for down in self.downs:
+            x = down(x)
+            skip_connections.append(x)
+            x = self.pool(x)
+        
+        x = self.bottleneck(x)
+        skip_connections = skip_connections[::-1]
+        
+        # Decode path
+        for idx in range(0, len(self.ups), 2):
+            x = self.ups[idx](x)
+            skip_connection = skip_connections[idx//2]
+
+            if x.shape != skip_connection.shape:
+                x = nn.functional.interpolate(x, size=skip_connection.shape[2:], mode='bilinear', align_corners=True)
+
+            concat_skip = torch.cat((skip_connection, x), dim=1)
+            x = self.ups[idx+1](concat_skip)
+
+        return self.final_conv(x)
 
 
 
-# set the device we will be using to run the model
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# load the list of categories in the COCO dataset and then generate a
-# set of bounding box colors for each class
-CLASSES = pickle.loads(open(args["labels"], "rb").read())
-COLORS = np.random.uniform(0, 255, size=(len(CLASSES), 3))
+model = UNet(in_channels=3, out_channels=1, features=[64, 128, 256, 512])
+device = torch.device("cuda") #if torch.cuda.is_available() else "cpu")
+model.to(device)
 
+# Define the loss function and optimizer
+criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-# initialize a dictionary containing model name and its corresponding 
-# torchvision function call
-MODELS = {
-	"frcnn-resnet": detection.fasterrcnn_resnet50_fpn,
-	"frcnn-mobilenet": detection.fasterrcnn_mobilenet_v3_large_320_fpn,
-	"retinanet": detection.retinanet_resnet50_fpn
-}
-# load the model and set it to evaluation mode
-model = MODELS[args["model"]](pretrained=True, progress=True,
-	num_classes=len(CLASSES), pretrained_backbone=True).to(DEVICE)
-model.eval()
+# Train the model
+num_epochs = 10
+for epoch in range(num_epochs):
+    for i, (images, masks) in enumerate(dataloader):
+        images = images.to(device)
+        masks = masks.to(device)
 
+        # Forward pass
+        outputs = model(images)
+        loss = criterion(outputs, masks.unsqueeze(1).float())
 
-image = cv2.imread(args["image"])
-orig = image.copy()
-# convert the image from BGR to RGB channel ordering and change the
-# image from channels last to channels first ordering
-image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-image = image.transpose((2, 0, 1))
-# add the batch dimension, scale the raw pixel intensities to the
-# range [0, 1], and convert the image to a floating point tensor
-image = np.expand_dims(image, axis=0)
-image = image / 255.0
-image = torch.FloatTensor(image)
-# send the input to the device and pass the it through the network to
-# get the detections and predictions
-image = image.to(DEVICE)
-detections = model(image)[0]
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-
-
-# loop over the detections
-for i in range(0, len(detections["boxes"])):
-	# extract the confidence (i.e., probability) associated with the
-	# prediction
-	confidence = detections["scores"][i]
-	# filter out weak detections by ensuring the confidence is
-	# greater than the minimum confidence
-	if confidence > args["confidence"]:
-		# extract the index of the class label from the detections,
-		# then compute the (x, y)-coordinates of the bounding box
-		# for the object
-		idx = int(detections["labels"][i])
-		box = detections["boxes"][i].detach().cpu().numpy()
-		(startX, startY, endX, endY) = box.astype("int")
-		# display the prediction to our terminal
-		label = "{}: {:.2f}%".format(CLASSES[idx], confidence * 100)
-		print("[INFO] {}".format(label))
-		# draw the bounding box and label on the image
-		cv2.rectangle(orig, (startX, startY), (endX, endY),
-			COLORS[idx], 2)
-		y = startY - 15 if startY - 15 > 15 else startY + 15
-		cv2.putText(orig, label, (startX, y),
-			cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS[idx], 2)
-# show the output image
-cv2.imshow("Output", orig)
-cv2.waitKey(0)
+        if (i+1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
