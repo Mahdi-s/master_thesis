@@ -5,6 +5,8 @@ from torchvision import transforms
 from PIL import Image
 import os
 import numpy as np
+import pandas as pd
+
 
 class WoundDataset(Dataset):
     def __init__(self, image_folder, mask_folder, transform=None):
@@ -29,8 +31,8 @@ class WoundDataset(Dataset):
         return image, np.array(mask)
 
 # Define the data directories
-image_folder = "/home/ec2-user/repos/master_thesis/WoundData/images"
-mask_folder = "/home/ec2-user/repos/master_thesis/WoundData/labels"
+image_folder = "/home/ubuntu/repos/central/master_thesis/images"
+mask_folder = "/home/ubuntu/repos/central/master_thesis/labels"
 
 # Define the transforms for data augmentation
 transform = transforms.Compose([
@@ -119,9 +121,22 @@ model.to(device)
 criterion = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
+
+# Initialize the metrics DataFrame
+columns = ["Epoch", "Loss", "Accuracy"]
+metrics_df = pd.DataFrame(columns=columns)
+
 # Train the model
-num_epochs = 10
-for epoch in range(num_epochs):
+num_epochs = 20
+for epoch in range(1,num_epochs+1):
+    # Set the model to training mode
+    model.train()
+
+    # Initialize the running loss and accuracy
+    running_loss = 0.0
+    correct_predictions = 0
+    total_predictions = 0
+
     for i, (images, masks) in enumerate(dataloader):
         images = images.to(device)
         masks = masks.to(device)
@@ -135,5 +150,25 @@ for epoch in range(num_epochs):
         loss.backward()
         optimizer.step()
 
+        # Update the running loss and accuracy
+        running_loss += loss.item() * images.size(0)
+        predicted_masks = torch.sigmoid(outputs) > 0.5
+        correct_predictions += (predicted_masks == masks.unsqueeze(1)).sum().item()
+        total_predictions += images.size(0)
+
         if (i+1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}")
+
+    # Calculate the epoch loss and accuracy
+    epoch_loss = running_loss / len(dataset)
+    epoch_accuracy = correct_predictions / total_predictions
+
+    # Add the metrics to the DataFrame
+    metrics = [epoch, epoch_loss, epoch_accuracy]
+    metrics_df.loc[len(metrics_df)] = metrics
+
+    #save model
+    torch.save(model.state_dict(), f"/home/ubuntu/repos/central/master_thesis/unet_epoch{epoch+1}.pt")
+
+# Save the metrics to a CSV file
+metrics_df.to_csv("/home/ubuntu/repos/central/master_thesis/unet_metrics.csv", index=False)
